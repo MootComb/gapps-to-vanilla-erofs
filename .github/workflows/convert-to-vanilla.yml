@@ -80,14 +80,42 @@ jobs:
           echo "=== extract support ==="
           fsck.erofs --help 2>&1 | grep -i "extract" || true
 
-      - name: Install payload-dumper-go
+      - name: Install otaripper (fastest payload extractor, Rust + SIMD)
         run: |
-          curl -L -o /tmp/payload-dumper-go.tar.gz \
-            https://github.com/ssut/payload-dumper-go/releases/latest/download/payload-dumper-go_linux_amd64.tar.gz
-          tar -xzf /tmp/payload-dumper-go.tar.gz -C /tmp
-          sudo mv /tmp/payload-dumper-go /usr/local/bin/
-          sudo chmod +x /usr/local/bin/payload-dumper-go
-          payload-dumper-go --version || true
+          set -e
+          # Try to find the latest linux static x86_64 asset
+          URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux-static-x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          if [ -z "$URL" ]; then
+            # Fallback to any linux x86_64 tar.gz
+            URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux.*x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+              | head -1)
+          fi
+          echo "Downloading otaripper: $URL"
+          if [ -z "$URL" ]; then
+            echo "ERROR: otaripper asset not found; falling back to payload-dumper-go"
+            # fallback: build payload-dumper-go from source with CGO
+            sudo apt-get install -y golang-go liblzma-dev
+            git clone --depth=1 https://github.com/ssut/payload-dumper-go.git /tmp/payload-dumper-go
+            cd /tmp/payload-dumper-go
+            CGO_ENABLED=1 go build -o /tmp/payload-dumper-go-bin .
+            sudo mv /tmp/payload-dumper-go-bin /usr/local/bin/otaripper
+            sudo chmod +x /usr/local/bin/otaripper
+          else
+            curl -L -o /tmp/otaripper.tar.gz "$URL"
+            tar -xzf /tmp/otaripper.tar.gz -C /tmp
+            # binary may be named otaripper
+            if [ -f /tmp/otaripper ]; then
+              sudo mv /tmp/otaripper /usr/local/bin/otaripper
+            else
+              sudo find /tmp -maxdepth 2 -name 'otaripper*' -type f -exec mv {} /usr/local/bin/otaripper \;
+            fi
+            sudo chmod +x /usr/local/bin/otaripper
+          fi
+          otaripper --version 2>&1 | head -5 || true
+          otaripper --help 2>&1 | head -20 || true
 
       - name: Create working directories on ext4 (/mnt/work) for xattr support
         run: |
@@ -117,7 +145,7 @@ jobs:
             "${{ github.event.inputs.vanilla_url }}"
           ls -lh vanilla/image
 
-      - name: Extract GApps archive and payload.bin
+      - name: Extract GApps archive and payload.bin (otaripper)
         run: |
           set -e
           cd gapps
@@ -134,19 +162,24 @@ jobs:
           fi
 
           if [ -f extracted/payload.bin ]; then
-            echo "GApps: payload.bin detected, extracting images..."
+            echo "GApps: payload.bin detected, extracting images with otaripper..."
             mkdir -p extracted/images
-            payload-dumper-go -o extracted/images extracted/payload.bin
-            ls -lh extracted/images/
-            [ -f extracted/images/system.img ] && mv extracted/images/system.img extracted/
-            [ -f extracted/images/system_ext.img ] && mv extracted/images/system_ext.img extracted/
-            [ -f extracted/images/product.img ] && mv extracted/images/product.img extracted/
+            # otaripper extracts directly from payload.bin
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || {
+              echo "otaripper failed, trying all partitions"
+              otaripper extracted/payload.bin -o extracted/images || true
+            }
+            ls -lh extracted/images/ || true
+            # otaripper may produce subdirectories; find system/system_ext/product images
+            find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
           fi
 
           echo "=== GApps extracted ==="
           ls -lh extracted/
 
-      - name: Extract Vanilla archive and payload.bin
+      - name: Extract Vanilla archive and payload.bin (otaripper)
         run: |
           set -e
           cd vanilla
@@ -163,13 +196,16 @@ jobs:
           fi
 
           if [ -f extracted/payload.bin ]; then
-            echo "Vanilla: payload.bin detected, extracting images..."
+            echo "Vanilla: payload.bin detected, extracting images with otaripper..."
             mkdir -p extracted/images
-            payload-dumper-go -o extracted/images extracted/payload.bin
-            ls -lh extracted/images/
-            [ -f extracted/images/system.img ] && mv extracted/images/system.img extracted/
-            [ -f extracted/images/system_ext.img ] && mv extracted/images/system_ext.img extracted/
-            [ -f extracted/images/product.img ] && mv extracted/images/product.img extracted/
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || {
+              echo "otaripper failed, trying all partitions"
+              otaripper extracted/payload.bin -o extracted/images || true
+            }
+            ls -lh extracted/images/ || true
+            find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
           fi
 
           echo "=== Vanilla extracted ==="
