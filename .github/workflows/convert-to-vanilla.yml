@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       gapps_url:
-        description: 'URL of the GApps firmware (zip, img.xz, or raw img)'
+        description: 'URL of the GApps firmware (zip OTA, zip images, img.xz, or raw img)'
         required: false
         default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-X6833B-18.10.2026-GAPPS-OFFICIAL.zip'
       vanilla_url:
-        description: 'URL of the Vanilla firmware (zip, img.xz, or raw img)'
+        description: 'URL of the Vanilla firmware (zip OTA, zip images, img.xz, or raw img)'
         required: false
         default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-dubai-18.10.2026-VANILLA-OFFICIAL.zip'
       release_tag:
@@ -56,7 +56,9 @@ jobs:
             pkg-config \
             autoconf \
             automake \
-            libtool
+            libtool \
+            python3 \
+            python3-pip
 
       - name: Build erofs-utils from source (>= 1.7 for fsck.erofs --extract=DIR)
         run: |
@@ -72,16 +74,32 @@ jobs:
           echo "=== erofs-utils installed ==="
           which mkfs.erofs fsck.erofs dump.erofs erofsfuse || true
           echo "=== mkfs.erofs ==="
-          mkfs.erofs 2>&1 | head -1
+          mkfs.erofs 2>&1 | head -1 || true
           echo "=== fsck.erofs ==="
-          fsck.erofs 2>&1 | head -1
+          fsck.erofs 2>&1 | head -1 || true
           echo "=== extract support ==="
           fsck.erofs --help 2>&1 | grep -i "extract" || true
 
-      - name: Create working directories
+      - name: Install payload-dumper-go
         run: |
-          mkdir -p gapps vanilla work
-          echo "Working directories created."
+          curl -L -o /tmp/payload-dumper-go.tar.gz \
+            https://github.com/ssut/payload-dumper-go/releases/latest/download/payload-dumper-go_linux_amd64.tar.gz
+          tar -xzf /tmp/payload-dumper-go.tar.gz -C /tmp
+          sudo mv /tmp/payload-dumper-go /usr/local/bin/
+          sudo chmod +x /usr/local/bin/payload-dumper-go
+          payload-dumper-go --version || true
+
+      - name: Create working directories on ext4 (/mnt/work) for xattr support
+        run: |
+          sudo mkdir -p /mnt/work
+          sudo chown $USER:$USER /mnt/work
+          mkdir -p /mnt/work/gapps /mnt/work/vanilla /mnt/work/work
+          ln -sfn /mnt/work/gapps gapps
+          ln -sfn /mnt/work/vanilla vanilla
+          ln -sfn /mnt/work/work work
+          echo "Working directories created in /mnt/work (ext4)."
+          df -T /mnt/work
+          mount | grep /mnt || true
 
       - name: Download GApps firmware
         run: |
@@ -99,7 +117,7 @@ jobs:
             "${{ github.event.inputs.vanilla_url }}"
           ls -lh vanilla/image
 
-      - name: Extract GApps archive
+      - name: Extract GApps archive and payload.bin
         run: |
           set -e
           cd gapps
@@ -115,9 +133,20 @@ jobs:
             mv image extracted/system.img
           fi
 
+          if [ -f extracted/payload.bin ]; then
+            echo "GApps: payload.bin detected, extracting images..."
+            mkdir -p extracted/images
+            payload-dumper-go -o extracted/images extracted/payload.bin
+            ls -lh extracted/images/
+            [ -f extracted/images/system.img ] && mv extracted/images/system.img extracted/
+            [ -f extracted/images/system_ext.img ] && mv extracted/images/system_ext.img extracted/
+            [ -f extracted/images/product.img ] && mv extracted/images/product.img extracted/
+          fi
+
+          echo "=== GApps extracted ==="
           ls -lh extracted/
 
-      - name: Extract Vanilla archive
+      - name: Extract Vanilla archive and payload.bin
         run: |
           set -e
           cd vanilla
@@ -133,6 +162,17 @@ jobs:
             mv image extracted/system.img
           fi
 
+          if [ -f extracted/payload.bin ]; then
+            echo "Vanilla: payload.bin detected, extracting images..."
+            mkdir -p extracted/images
+            payload-dumper-go -o extracted/images extracted/payload.bin
+            ls -lh extracted/images/
+            [ -f extracted/images/system.img ] && mv extracted/images/system.img extracted/
+            [ -f extracted/images/system_ext.img ] && mv extracted/images/system_ext.img extracted/
+            [ -f extracted/images/product.img ] && mv extracted/images/product.img extracted/
+          fi
+
+          echo "=== Vanilla extracted ==="
           ls -lh extracted/
 
       - name: Auto-detect image formats and extract partitions
@@ -146,31 +186,26 @@ jobs:
             mkdir -p "$out"
             echo "  Image: $img"
 
-            # 1) EROFS: try extract.erofs
             if command -v extract.erofs >/dev/null 2>&1; then
               if extract.erofs "$out" "$img" >/dev/null 2>&1; then
                 echo "  OK: extract.erofs"
                 return 0
               fi
             fi
-            # 2) EROFS: try fsck.erofs --extract=DIR
             if fsck.erofs --extract="$out" "$img" >/dev/null 2>&1; then
               echo "  OK: fsck.erofs --extract=DIR"
               return 0
             fi
-            # 3) EROFS: try erofsfuse
             if command -v erofsfuse >/dev/null 2>&1; then
               if erofsfuse "$img" "$out" >/dev/null 2>&1; then
                 echo "  OK: erofsfuse"
                 return 0
               fi
             fi
-            # 4) ext4: mount loop
             if sudo mount -o loop,ro "$img" "$out" >/dev/null 2>&1; then
               echo "  OK: ext4 mount"
               return 0
             fi
-            # 5) Android sparse: simg2img then recurse
             if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
               echo "  OK: sparse → simg2img"
               extract_image "${img}.raw" "$out"
@@ -183,7 +218,7 @@ jobs:
 
           echo "=== Extracting GApps partitions ==="
           for part in system system_ext product; do
-            img=$(find ../gapps/extracted -name "${part}.img" 2>/dev/null | head -1)
+            img=$(find ../gapps/extracted -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
             if [ -n "$img" ]; then
               echo "GApps ${part}: $img"
               extract_image "$img" "gapps_${part}_raw" || exit 1
@@ -194,7 +229,7 @@ jobs:
 
           echo "=== Extracting Vanilla partitions ==="
           for part in system system_ext product; do
-            img=$(find ../vanilla/extracted -name "${part}.img" 2>/dev/null | head -1)
+            img=$(find ../vanilla/extracted -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
             if [ -n "$img" ]; then
               echo "Vanilla ${part}: $img"
               extract_image "$img" "vanilla_${part}_raw" || exit 1
@@ -347,7 +382,6 @@ jobs:
           mkdir -p gapps_product_raw/lib64
           mkdir -p gapps_product_raw/overlay
 
-          # --- system ---
           cp -a vanilla_system_raw/system/app/ExtShared/. gapps_system_raw/system/app/ExtShared/ 2>/dev/null || true
           if [ -f gapps_system_raw/system/app/ExtShared/ExtShared.apk ]; then
             setfattr -n security.selinux -v "u:object_r:system_file:s0" gapps_system_raw/system/app/ExtShared/ExtShared.apk || true
@@ -368,12 +402,10 @@ jobs:
           cp -a vanilla_system_raw/system/etc/permissions/android.software.live_wallpaper.xml \
                 gapps_system_raw/system/etc/permissions/ 2>/dev/null || true
 
-          # --- system_ext ---
           for d in Provision ThemePicker; do
             cp -a vanilla_system_ext_raw/priv-app/$d/. gapps_system_ext_raw/priv-app/$d/ 2>/dev/null || true
           done
 
-          # --- product ---
           cp -a vanilla_product_raw/app/ModuleMetadata/. gapps_product_raw/app/ModuleMetadata/ 2>/dev/null || true
           for d in DeskClock ExactCalculator LatinIME webview; do
             cp -a vanilla_product_raw/app/$d/. gapps_product_raw/app/$d/ 2>/dev/null || true
@@ -385,7 +417,6 @@ jobs:
           cp -a vanilla_product_raw/etc/permissions/com.android.contacts.xml \
                 gapps_product_raw/etc/permissions/ 2>/dev/null || true
 
-          # --- SELinux labels for copied APKs ---
           for f in \
             gapps_product_raw/app/DeskClock/DeskClock.apk \
             gapps_product_raw/app/ExactCalculator/ExactCalculator.apk \
@@ -402,7 +433,6 @@ jobs:
             fi
           done
 
-          # --- android.ext.services APEX (AOSP) ---
           if [ ! -f gapps_system_raw/system/apex/com.android.extservices.apex ]; then
             if [ -f vanilla_system_raw/system/apex/com.android.extservices.capex ]; then
               mkdir -p /tmp/capex_extract
@@ -424,8 +454,8 @@ jobs:
           cd work
 
           for part in system system_ext product; do
-            img="../gapps/extracted/${part}.img"
-            if [ -f "$img" ]; then
+            img=$(find ../gapps/extracted -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ] && [ -f "$img" ]; then
               if dump.erofs -s "$img" >/dev/null 2>&1; then
                 UUID=$(dump.erofs -s "$img" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
                 echo "${part}: EROFS, UUID=${UUID:-unknown}"
@@ -552,8 +582,8 @@ jobs:
           }
 
           for part in system system_ext product; do
-            img="../gapps/extracted/${part}.img"
-            if [ -f "$img" ]; then
+            img=$(find ../gapps/extracted -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ] && [ -f "$img" ]; then
               opts=$(detect_erofs_params "$img")
               echo "EROFS params for ${part}: $opts"
               echo "$opts" > "${part}_erofs_params.txt"
@@ -608,22 +638,22 @@ jobs:
             fmt=$(cat "${part}_format.txt" 2>/dev/null || echo "erofs")
             uuid=$(cat "${part}_uuid.txt" 2>/dev/null || echo "")
             params_file="${part}_erofs_params.txt"
-            orig_img="../gapps/extracted/${part}.img"
+            orig_img=$(find ../gapps/extracted -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
 
             if [ ! -d "$raw" ]; then
               echo "WARNING: $raw not found, skipping $part"
               continue
             fi
 
-            echo "=== Building $part (format=$fmt, uuid=$uuid) ==="
+            echo "=== Building ${part} (format=$fmt, uuid=$uuid) ==="
             if [ "$fmt" = "ext4" ]; then
-              build_ext4 "$raw" "${part}_new.img" "$uuid" "$orig_img"
+              build_ext4 "$raw" "${part}.img" "$uuid" "$orig_img"
             else
-              build_erofs "$raw" "${part}_new.img" "$uuid" "$params_file"
+              build_erofs "$raw" "${part}.img" "$uuid" "$params_file"
             fi
 
-            file "${part}_new.img"
-            ls -lh "${part}_new.img"
+            file "${part}.img"
+            ls -lh "${part}.img"
           done
 
       - name: Create recovery flashable ZIP
@@ -632,9 +662,9 @@ jobs:
           cd work
           mkdir -p zip/META-INF/com/google/android
 
-          cp system_new.img zip/system.img
-          cp system_ext_new.img zip/system_ext.img
-          cp product_new.img zip/product.img
+          cp system.img zip/system.img
+          cp system_ext.img zip/system_ext.img
+          cp product.img zip/product.img
 
           cat > zip/META-INF/com/google/android/update-binary <<'EOF'
           #!/sbin/sh
@@ -714,17 +744,17 @@ jobs:
             Vanilla source: ${{ github.event.inputs.vanilla_url }}
 
             Artifacts:
-            - system_new.img
-            - system_ext_new.img
-            - product_new.img
+            - system.img
+            - system_ext.img
+            - product.img
             - convert-to-vanilla.zip (recovery flashable)
 
             Filesystem parameters and UUIDs preserved from original images.
             SELinux contexts preserved.
           files: |
-            work/system_new.img
-            work/system_ext_new.img
-            work/product_new.img
+            work/system.img
+            work/system_ext.img
+            work/product.img
             work/convert-to-vanilla.zip
           draft: false
           prerelease: false
@@ -737,9 +767,9 @@ jobs:
         with:
           name: vanilla-images
           path: |
-            work/system_new.img
-            work/system_ext_new.img
-            work/product_new.img
+            work/system.img
+            work/system_ext.img
+            work/product.img
             work/convert-to-vanilla.zip
             work/*_format.txt
             work/*_uuid.txt
