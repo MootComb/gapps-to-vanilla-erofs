@@ -45,7 +45,34 @@ jobs:
             curl \
             wget \
             jq \
-            file
+            file \
+            build-essential \
+            liblz4-dev \
+            liblzma-dev \
+            libzstd-dev \
+            uuid-dev \
+            libselinux1-dev \
+            libfuse-dev \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool
+
+      - name: Build erofs-utils from source (>= 1.7 for extract.erofs)
+        run: |
+          git clone --depth=1 --branch v1.7.1 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git \
+            /tmp/erofs-utils
+          cd /tmp/erofs-utils
+          ./autogen.sh
+          ./configure --prefix=/usr/local --enable-fuse
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          echo "=== erofs-utils installed ==="
+          which mkfs.erofs fsck.erofs extract.erofs dump.erofs erofsfuse || true
+          mkfs.erofs --version
+          extract.erofs --help 2>&1 | head -10 || true
 
       - name: Create working directories
         run: |
@@ -59,7 +86,6 @@ jobs:
             -o gapps/image \
             "${{ github.event.inputs.gapps_url }}"
           ls -lh gapps/image
-          file gapps/image
 
       - name: Download Vanilla firmware
         run: |
@@ -68,35 +94,23 @@ jobs:
             -o vanilla/image \
             "${{ github.event.inputs.vanilla_url }}"
           ls -lh vanilla/image
-          file vanilla/image
 
       - name: Extract GApps archive
         run: |
           set -e
           cd gapps
           mkdir -p extracted
-          if file image | grep -q "Zip archive"; then
-            echo "GApps: Zip archive detected"
-            unzip -o image -d extracted
-          elif file image | grep -q "XZ compressed"; then
-            echo "GApps: XZ compressed detected"
-            xz -dk image
-            if [ -f image ]; then
-              mv image extracted/system.img
-            fi
-          elif file image | grep -q "Android sparse"; then
-            echo "GApps: Android sparse image detected"
-            mv image extracted/system.img
-          elif file image | grep -q "EROFS"; then
-            echo "GApps: EROFS image detected"
-            mv image extracted/system.img
-          elif file image | grep -q "ext[234] filesystem"; then
-            echo "GApps: ext4 image detected"
-            mv image extracted/system.img
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "GApps: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "GApps: xz OK"
+            [ -f image ] && mv image extracted/system.img
           else
-            echo "GApps: Raw image (unknown format), treating as system.img"
+            echo "GApps: raw image (no archive), treating as system.img"
             mv image extracted/system.img
           fi
+
           ls -lh extracted/
 
       - name: Extract Vanilla archive
@@ -104,28 +118,17 @@ jobs:
           set -e
           cd vanilla
           mkdir -p extracted
-          if file image | grep -q "Zip archive"; then
-            echo "Vanilla: Zip archive detected"
-            unzip -o image -d extracted
-          elif file image | grep -q "XZ compressed"; then
-            echo "Vanilla: XZ compressed detected"
-            xz -dk image
-            if [ -f image ]; then
-              mv image extracted/system.img
-            fi
-          elif file image | grep -q "Android sparse"; then
-            echo "Vanilla: Android sparse image detected"
-            mv image extracted/system.img
-          elif file image | grep -q "EROFS"; then
-            echo "Vanilla: EROFS image detected"
-            mv image extracted/system.img
-          elif file image | grep -q "ext[234] filesystem"; then
-            echo "Vanilla: ext4 image detected"
-            mv image extracted/system.img
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "Vanilla: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "Vanilla: xz OK"
+            [ -f image ] && mv image extracted/system.img
           else
-            echo "Vanilla: Raw image (unknown format), treating as system.img"
+            echo "Vanilla: raw image (no archive), treating as system.img"
             mv image extracted/system.img
           fi
+
           ls -lh extracted/
 
       - name: Auto-detect image formats and extract partitions
@@ -137,24 +140,41 @@ jobs:
             local img="$1"
             local out="$2"
             mkdir -p "$out"
-            local ftype=$(file -b "$img")
             echo "  Image: $img"
-            echo "  Type:  $ftype"
 
-            if echo "$ftype" | grep -q "EROFS"; then
-              echo "  Action: EROFS extract via fsck.erofs"
-              fsck.erofs --extract="$out" "$img"
-            elif echo "$ftype" | grep -qE "ext[234] filesystem"; then
-              echo "  Action: ext4 mount via loop"
-              sudo mount -o loop,ro "$img" "$out"
-            elif echo "$ftype" | grep -q "Android sparse"; then
-              echo "  Action: Android sparse via simg2img"
-              simg2img "$img" "${img}.raw"
-              extract_image "${img}.raw" "$out"
-            else
-              echo "  Action: Unknown format, attempting fsck.erofs"
-              fsck.erofs --extract="$out" "$img" || true
+            # 1) EROFS: try extract.erofs
+            if command -v extract.erofs >/dev/null 2>&1; then
+              if extract.erofs "$out" "$img" >/dev/null 2>&1; then
+                echo "  OK: extract.erofs"
+                return 0
+              fi
             fi
+            # 2) EROFS: try fsck.erofs --extract=DIR
+            if fsck.erofs --extract="$out" "$img" >/dev/null 2>&1; then
+              echo "  OK: fsck.erofs --extract=DIR"
+              return 0
+            fi
+            # 3) EROFS: try erofsfuse
+            if command -v erofsfuse >/dev/null 2>&1; then
+              if erofsfuse "$img" "$out" >/dev/null 2>&1; then
+                echo "  OK: erofsfuse"
+                return 0
+              fi
+            fi
+            # 4) ext4: mount loop
+            if sudo mount -o loop,ro "$img" "$out" >/dev/null 2>&1; then
+              echo "  OK: ext4 mount"
+              return 0
+            fi
+            # 5) Android sparse: simg2img then recurse
+            if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
+              echo "  OK: sparse → simg2img"
+              extract_image "${img}.raw" "$out"
+              return $?
+            fi
+
+            echo "  ERROR: unable to extract $img"
+            return 1
           }
 
           echo "=== Extracting GApps partitions ==="
@@ -162,7 +182,7 @@ jobs:
             img=$(find ../gapps/extracted -name "${part}.img" 2>/dev/null | head -1)
             if [ -n "$img" ]; then
               echo "GApps ${part}: $img"
-              extract_image "$img" "gapps_${part}_raw"
+              extract_image "$img" "gapps_${part}_raw" || exit 1
             else
               echo "WARNING: GApps ${part}.img not found"
             fi
@@ -173,7 +193,7 @@ jobs:
             img=$(find ../vanilla/extracted -name "${part}.img" 2>/dev/null | head -1)
             if [ -n "$img" ]; then
               echo "Vanilla ${part}: $img"
-              extract_image "$img" "vanilla_${part}_raw"
+              extract_image "$img" "vanilla_${part}_raw" || exit 1
             else
               echo "WARNING: Vanilla ${part}.img not found"
             fi
@@ -307,8 +327,23 @@ jobs:
 
           echo "Adding AOSP components from Vanilla"
 
-          # --- system partition ---
           mkdir -p gapps_system_raw/system/app/ExtShared
+          mkdir -p gapps_system_raw/system/etc/permissions
+          mkdir -p gapps_system_raw/system/priv-app/LiveWallpapersPicker
+          mkdir -p gapps_system_raw/system/priv-app/ContactsPicker
+          mkdir -p gapps_system_raw/system/app/WallpaperBackup
+          mkdir -p gapps_system_ext_raw/priv-app/Provision
+          mkdir -p gapps_system_ext_raw/priv-app/ThemePicker
+          mkdir -p gapps_product_raw/app/ModuleMetadata
+          mkdir -p gapps_product_raw/app/DeskClock
+          mkdir -p gapps_product_raw/app/ExactCalculator
+          mkdir -p gapps_product_raw/app/LatinIME
+          mkdir -p gapps_product_raw/app/webview
+          mkdir -p gapps_product_raw/priv-app/Contacts
+          mkdir -p gapps_product_raw/lib64
+          mkdir -p gapps_product_raw/overlay
+
+          # --- system ---
           cp -a vanilla_system_raw/system/app/ExtShared/. gapps_system_raw/system/app/ExtShared/ 2>/dev/null || true
           if [ -f gapps_system_raw/system/app/ExtShared/ExtShared.apk ]; then
             setfattr -n security.selinux -v "u:object_r:system_file:s0" gapps_system_raw/system/app/ExtShared/ExtShared.apk || true
@@ -323,39 +358,25 @@ jobs:
           setfattr -n security.selinux -v "u:object_r:system_file:s0" gapps_system_raw/system/etc/permissions/android.ext.shared.xml || true
 
           for d in LiveWallpapersPicker ContactsPicker; do
-            mkdir -p gapps_system_raw/system/priv-app/$d
             cp -a vanilla_system_raw/system/priv-app/$d/. gapps_system_raw/system/priv-app/$d/ 2>/dev/null || true
           done
-
-          mkdir -p gapps_system_raw/system/app/WallpaperBackup
           cp -a vanilla_system_raw/system/app/WallpaperBackup/. gapps_system_raw/system/app/WallpaperBackup/ 2>/dev/null || true
-
           cp -a vanilla_system_raw/system/etc/permissions/android.software.live_wallpaper.xml \
                 gapps_system_raw/system/etc/permissions/ 2>/dev/null || true
 
-          # --- system_ext partition ---
+          # --- system_ext ---
           for d in Provision ThemePicker; do
-            mkdir -p gapps_system_ext_raw/priv-app/$d
             cp -a vanilla_system_ext_raw/priv-app/$d/. gapps_system_ext_raw/priv-app/$d/ 2>/dev/null || true
           done
 
-          # --- product partition ---
-          mkdir -p gapps_product_raw/app/ModuleMetadata
+          # --- product ---
           cp -a vanilla_product_raw/app/ModuleMetadata/. gapps_product_raw/app/ModuleMetadata/ 2>/dev/null || true
-
           for d in DeskClock ExactCalculator LatinIME webview; do
-            mkdir -p gapps_product_raw/app/$d
             cp -a vanilla_product_raw/app/$d/. gapps_product_raw/app/$d/ 2>/dev/null || true
           done
-
-          mkdir -p gapps_product_raw/lib64
           cp -a vanilla_product_raw/lib64/libjni_latinime.so gapps_product_raw/lib64/ 2>/dev/null || true
-
-          mkdir -p gapps_product_raw/overlay
           cp -a vanilla_product_raw/overlay/LatinIME__*_auto_generated_rro_product.apk \
                 gapps_product_raw/overlay/LatinIME__infinity_X6833B__auto_generated_rro_product.apk 2>/dev/null || true
-
-          mkdir -p gapps_product_raw/priv-app/Contacts
           cp -a vanilla_product_raw/priv-app/Contacts/. gapps_product_raw/priv-app/Contacts/ 2>/dev/null || true
           cp -a vanilla_product_raw/etc/permissions/com.android.contacts.xml \
                 gapps_product_raw/etc/permissions/ 2>/dev/null || true
@@ -401,39 +422,30 @@ jobs:
           for part in system system_ext product; do
             img="../gapps/extracted/${part}.img"
             if [ -f "$img" ]; then
-              ftype=$(file -b "$img")
-              echo "GApps ${part}: $ftype"
-
-              if echo "$ftype" | grep -q "EROFS"; then
+              if dump.erofs -s "$img" >/dev/null 2>&1; then
                 UUID=$(dump.erofs -s "$img" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
-                if [ -z "$UUID" ]; then
-                  UUID=$(file -b "$img" | grep -oP 'uuid=\K[0-9a-f-]+' | head -1 || true)
-                fi
-                echo "  UUID: ${UUID:-unknown}"
+                echo "${part}: EROFS, UUID=${UUID:-unknown}"
                 echo "$UUID" > "${part}_uuid.txt"
                 echo "erofs" > "${part}_format.txt"
-              elif echo "$ftype" | grep -qE "ext[234] filesystem"; then
+              elif blkid -o value -s UUID "$img" >/dev/null 2>&1; then
                 UUID=$(blkid -o value -s UUID "$img" 2>/dev/null || true)
-                if [ -z "$UUID" ]; then
-                  UUID=$(dumpe2fs -h "$img" 2>/dev/null | grep -i "UUID" | awk '{print $3}' || true)
-                fi
-                echo "  UUID: ${UUID:-unknown}"
+                echo "${part}: ext4, UUID=${UUID:-unknown}"
                 echo "$UUID" > "${part}_uuid.txt"
                 echo "ext4" > "${part}_format.txt"
-              elif echo "$ftype" | grep -q "Android sparse"; then
-                simg2img "$img" "${img}.raw"
-                ftype2=$(file -b "${img}.raw")
-                if echo "$ftype2" | grep -q "EROFS"; then
+              elif simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
+                if dump.erofs -s "${img}.raw" >/dev/null 2>&1; then
                   UUID=$(dump.erofs -s "${img}.raw" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
+                  echo "${part}: sparse EROFS, UUID=${UUID:-unknown}"
                   echo "$UUID" > "${part}_uuid.txt"
                   echo "erofs" > "${part}_format.txt"
-                elif echo "$ftype2" | grep -qE "ext[234] filesystem"; then
+                elif blkid -o value -s UUID "${img}.raw" >/dev/null 2>&1; then
                   UUID=$(blkid -o value -s UUID "${img}.raw" 2>/dev/null || true)
+                  echo "${part}: sparse ext4, UUID=${UUID:-unknown}"
                   echo "$UUID" > "${part}_uuid.txt"
                   echo "ext4" > "${part}_format.txt"
                 fi
               else
-                echo "  Unknown format"
+                echo "${part}: unknown format"
                 echo "" > "${part}_uuid.txt"
                 echo "erofs" > "${part}_format.txt"
               fi
@@ -444,7 +456,7 @@ jobs:
             fi
           done
 
-          echo "=== Detected UUIDs and formats ==="
+          echo "=== Detected ==="
           for part in system system_ext product; do
             echo "${part}: format=$(cat ${part}_format.txt) uuid=$(cat ${part}_uuid.txt)"
           done
@@ -472,7 +484,7 @@ jobs:
 
             local dump=""
             if command -v dump.erofs >/dev/null 2>&1; then
-              dump=$(dump.erofs -s "$img" 2>/dev/null || dump.erofs --superblock "$img" 2>/dev/null || true)
+              dump=$(dump.erofs -s "$img" 2>/dev/null || true)
             fi
 
             local blocksize=4096
@@ -522,15 +534,9 @@ jobs:
               fi
             fi
 
-            if [ -z "$blocksize" ]; then
-              blocksize=4096
-            fi
-            if [ -z "$pcluster" ]; then
-              pcluster=65536
-            fi
-            if [ -z "$comp" ]; then
-              comp="lz4hc"
-            fi
+            [ -z "$blocksize" ] && blocksize=4096
+            [ -z "$pcluster" ] && pcluster=65536
+            [ -z "$comp" ] && comp="lz4hc"
 
             opts="-z$comp$comp_level -b$blocksize"
             if [ "$pcluster" != "4096" ]; then
@@ -638,13 +644,6 @@ jobs:
 
           set_progress() {
             echo "set_progress $1" >&$OUTFD
-          }
-
-          mount_partitions() {
-            mount /system 2>/dev/null || true
-            mount /system_ext 2>/dev/null || true
-            mount /product 2>/dev/null || true
-            mount /vendor 2>/dev/null || true
           }
 
           flash_image() {
