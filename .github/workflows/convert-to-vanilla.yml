@@ -58,7 +58,7 @@ jobs:
             automake \
             libtool
 
-      - name: Build erofs-utils from source (>= 1.7 for extract.erofs)
+      - name: Build erofs-utils from source (>= 1.7 for fsck.erofs --extract=DIR)
         run: |
           git clone --depth=1 --branch v1.7.1 \
             https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git \
@@ -70,9 +70,13 @@ jobs:
           sudo make install
           sudo ldconfig
           echo "=== erofs-utils installed ==="
-          which mkfs.erofs fsck.erofs extract.erofs dump.erofs erofsfuse || true
-          mkfs.erofs --version
-          extract.erofs --help 2>&1 | head -10 || true
+          which mkfs.erofs fsck.erofs dump.erofs erofsfuse || true
+          echo "=== mkfs.erofs ==="
+          mkfs.erofs 2>&1 | head -1
+          echo "=== fsck.erofs ==="
+          fsck.erofs 2>&1 | head -1
+          echo "=== extract support ==="
+          fsck.erofs --help 2>&1 | grep -i "extract" || true
 
       - name: Create working directories
         run: |
