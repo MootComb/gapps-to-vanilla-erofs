@@ -72,11 +72,11 @@ jobs:
           df -T "$WORK_ROOT"
           mount | grep /mnt || true
 
-      - name: Build erofs-utils from source (>= 1.7 for fsck.erofs --extract=DIR)
+      - name: Build erofs-utils from source (>= 1.8 for fsck.erofs --xattrs)
         run: |
           set -e
           SRC="$WORK_ROOT/erofs-utils-src"
-          git clone --depth=1 --branch v1.7.1 \
+          git clone --depth=1 --branch v1.8.2 \
             https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git "$SRC"
           cd "$SRC"
           ./autogen.sh
@@ -85,13 +85,15 @@ jobs:
           sudo make install
           sudo ldconfig
           echo "=== erofs-utils installed ==="
-          which mkfs.erofs fsck.erofs dump.erofs erofsfuse || true
+          which mkfs.erofs fsck.erofs dump.erofs erofsfuse extract.erofs || true
           echo "=== mkfs.erofs ==="
           mkfs.erofs 2>&1 | head -1 || true
           echo "=== fsck.erofs ==="
           fsck.erofs 2>&1 | head -1 || true
           echo "=== extract support ==="
-          fsck.erofs --help 2>&1 | grep -i "extract" || true
+          fsck.erofs --help 2>&1 | grep -i "xattr" || true
+          echo "=== extract.erofs ==="
+          extract.erofs --help 2>&1 | head -5 || true
 
       - name: Install otaripper (fastest payload extractor, Rust + SIMD)
         run: |
@@ -209,26 +211,27 @@ jobs:
             mkdir -p "$out"
             echo "  Image: $img"
 
+            # 1. fsck.erofs --extract --xattrs --preserve (EROFS, xattr preserved)
+            if fsck.erofs --extract="$out" --xattrs --preserve "$img" >/dev/null 2>&1; then
+              echo "  OK: fsck.erofs --extract --xattrs --preserve"
+              return 0
+            fi
+
+            # 2. extract.erofs -x (EROFS, xattr preserved)
             if command -v extract.erofs >/dev/null 2>&1; then
-              if extract.erofs "$out" "$img" >/dev/null 2>&1; then
-                echo "  OK: extract.erofs"
+              if extract.erofs -x -i "$img" -o "$out" >/dev/null 2>&1; then
+                echo "  OK: extract.erofs -x"
                 return 0
               fi
             fi
-            if fsck.erofs --extract="$out" "$img" >/dev/null 2>&1; then
-              echo "  OK: fsck.erofs --extract=DIR"
-              return 0
-            fi
-            if command -v erofsfuse >/dev/null 2>&1; then
-              if erofsfuse "$img" "$out" >/dev/null 2>&1; then
-                echo "  OK: erofsfuse"
-                return 0
-              fi
-            fi
+
+            # 3. mount -o loop (ext4/ext3/ext2, xattr preserved)
             if sudo mount -o loop,ro "$img" "$out" >/dev/null 2>&1; then
-              echo "  OK: ext4 mount"
+              echo "  OK: mount loop (xattr preserved)"
               return 0
             fi
+
+            # 4. sparse → simg2img → retry
             if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
               echo "  OK: sparse → simg2img"
               extract_image "${img}.raw" "$out"
