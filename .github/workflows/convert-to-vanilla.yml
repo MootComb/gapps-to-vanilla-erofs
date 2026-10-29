@@ -107,7 +107,6 @@ jobs:
           echo "Downloading otaripper: $URL"
           mkdir -p "$WORK_ROOT/otaripper"
           curl -L -o "$WORK_ROOT/otaripper.tar.gz" "$URL"
-          # Extract with --no-same-owner --no-same-permissions to avoid utime/chmod errors
           tar --no-same-owner --no-same-permissions -xzf "$WORK_ROOT/otaripper.tar.gz" -C "$WORK_ROOT/otaripper" || true
           BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
           if [ -z "$BIN" ]; then
@@ -397,6 +396,7 @@ jobs:
           mkdir -p gapps_system_raw/system/app/WallpaperBackup
           mkdir -p gapps_system_ext_raw/priv-app/Provision
           mkdir -p gapps_system_ext_raw/priv-app/ThemePicker
+          mkdir -p gapps_system_ext_raw/etc/permissions
           mkdir -p gapps_product_raw/app/ModuleMetadata
           mkdir -p gapps_product_raw/app/DeskClock
           mkdir -p gapps_product_raw/app/ExactCalculator
@@ -407,20 +407,18 @@ jobs:
           mkdir -p gapps_product_raw/lib64
           mkdir -p gapps_product_raw/overlay
           mkdir -p gapps_product_raw/etc/sysconfig
+          mkdir -p gapps_product_raw/etc/permissions
 
-          # ExtShared
           cp -a vanilla_system_raw/system/app/ExtShared/. gapps_system_raw/system/app/ExtShared/ 2>/dev/null || true
-          if [ -f gapps_system_raw/system/app/ExtShared/ExtShared.apk ]; then
-            setfattr -n security.selinux -v "u:object_r:system_file:s0" gapps_system_raw/system/app/ExtShared/ExtShared.apk || true
-          fi
 
-          cat > gapps_system_raw/system/etc/permissions/android.ext.shared.xml <<'EOF'
+          if ! grep -rq "android.ext.shared" vanilla_system_raw/system/etc/permissions/ vanilla_system_raw/etc/permissions/ 2>/dev/null; then
+            cat > gapps_system_raw/system/etc/permissions/android.ext.shared.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <permissions>
               <library name="android.ext.shared" file="/system/app/ExtShared/ExtShared.apk"/>
           </permissions>
           EOF
-          setfattr -n security.selinux -v "u:object_r:system_file:s0" gapps_system_raw/system/etc/permissions/android.ext.shared.xml || true
+          fi
 
           for d in LiveWallpapersPicker ContactsPicker; do
             cp -a vanilla_system_raw/system/priv-app/$d/. gapps_system_raw/system/priv-app/$d/ 2>/dev/null || true
@@ -429,47 +427,72 @@ jobs:
           cp -a vanilla_system_raw/system/etc/permissions/android.software.live_wallpaper.xml \
                 gapps_system_raw/system/etc/permissions/ 2>/dev/null || true
 
-          # system_ext
           for d in Provision ThemePicker; do
             cp -a vanilla_system_ext_raw/priv-app/$d/. gapps_system_ext_raw/priv-app/$d/ 2>/dev/null || true
           done
+          cp -a vanilla_system_ext_raw/etc/permissions/com.android.provision.xml \
+                gapps_system_ext_raw/etc/permissions/ 2>/dev/null || true
 
-          # product
           cp -a vanilla_product_raw/app/ModuleMetadata/. gapps_product_raw/app/ModuleMetadata/ 2>/dev/null || true
-          for d in DeskClock ExactCalculator LatinIME webview; do
+          for d in DeskClock ExactCalculator LatinIME webview Jelly; do
             cp -a vanilla_product_raw/app/$d/. gapps_product_raw/app/$d/ 2>/dev/null || true
           done
-          # Jelly (LineageOS browser)
-          cp -a vanilla_product_raw/app/Jelly/. gapps_product_raw/app/Jelly/ 2>/dev/null || true
           cp -a vanilla_product_raw/etc/sysconfig/preinstalled-packages-org.lineageos.jelly.xml gapps_product_raw/etc/sysconfig/ 2>/dev/null || true
           cp -a vanilla_product_raw/etc/sysconfig/initial-package-stopped-states-org.lineageos.jelly.xml gapps_product_raw/etc/sysconfig/ 2>/dev/null || true
-
           cp -a vanilla_product_raw/lib64/libjni_latinime.so gapps_product_raw/lib64/ 2>/dev/null || true
           cp -a vanilla_product_raw/overlay/LatinIME__*_auto_generated_rro_product.apk \
-                gapps_product_raw/overlay/LatinIME__infinity_X6833B__auto_generated_rro_product.apk 2>/dev/null || true
+                gapps_product_raw/overlay/ 2>/dev/null || true
           cp -a vanilla_product_raw/priv-app/Contacts/. gapps_product_raw/priv-app/Contacts/ 2>/dev/null || true
           cp -a vanilla_product_raw/etc/permissions/com.android.contacts.xml \
                 gapps_product_raw/etc/permissions/ 2>/dev/null || true
 
-          # SELinux labels
-          for f in \
-            gapps_product_raw/app/DeskClock/DeskClock.apk \
-            gapps_product_raw/app/ExactCalculator/ExactCalculator.apk \
-            gapps_product_raw/app/LatinIME/LatinIME.apk \
-            gapps_product_raw/app/webview/webview.apk \
-            gapps_product_raw/app/Jelly/Jelly.apk \
-            gapps_product_raw/priv-app/Contacts/Contacts.apk \
-            gapps_system_raw/system/priv-app/LiveWallpapersPicker/LiveWallpapersPicker.apk \
-            gapps_system_raw/system/app/WallpaperBackup/WallpaperBackup.apk \
-            gapps_system_raw/system/priv-app/ContactsPicker/ContactsPicker.apk \
-            gapps_system_ext_raw/priv-app/Provision/Provision.apk \
-            gapps_system_ext_raw/priv-app/ThemePicker/ThemePicker.apk; do
-            if [ -f "$f" ]; then
-              setfattr -n security.selinux -v "u:object_r:system_file:s0" "$f" || true
+          echo "Setting SELinux labels on all added files"
+
+          set_label_file() {
+            if [ -f "$1" ]; then
+              setfattr -n security.selinux -v "u:object_r:system_file:s0" "$1" 2>/dev/null || true
             fi
+          }
+
+          set_label_dir() {
+            if [ -d "$1" ]; then
+              find "$1" -type f | while read -r f; do
+                setfattr -n security.selinux -v "u:object_r:system_file:s0" "$f" 2>/dev/null || true
+              done
+              find "$1" -type d | while read -r d; do
+                setfattr -n security.selinux -v "u:object_r:system_file:s0" "$d" 2>/dev/null || true
+              done
+            fi
+          }
+
+          set_label_dir gapps_system_raw/system/app/ExtShared
+          set_label_file gapps_system_raw/system/etc/permissions/android.ext.shared.xml
+          set_label_dir gapps_system_raw/system/priv-app/LiveWallpapersPicker
+          set_label_dir gapps_system_raw/system/priv-app/ContactsPicker
+          set_label_dir gapps_system_raw/system/app/WallpaperBackup
+          set_label_file gapps_system_raw/system/etc/permissions/android.software.live_wallpaper.xml
+
+          set_label_dir gapps_system_ext_raw/priv-app/Provision
+          set_label_dir gapps_system_ext_raw/priv-app/ThemePicker
+          set_label_file gapps_system_ext_raw/etc/permissions/com.android.provision.xml
+
+          set_label_dir gapps_product_raw/app/ModuleMetadata
+          set_label_dir gapps_product_raw/app/DeskClock
+          set_label_dir gapps_product_raw/app/ExactCalculator
+          set_label_dir gapps_product_raw/app/LatinIME
+          set_label_dir gapps_product_raw/app/webview
+          set_label_dir gapps_product_raw/app/Jelly
+          set_label_dir gapps_product_raw/priv-app/Contacts
+
+          set_label_file gapps_product_raw/lib64/libjni_latinime.so
+          set_label_file gapps_product_raw/etc/permissions/com.android.contacts.xml
+          set_label_file gapps_product_raw/etc/sysconfig/preinstalled-packages-org.lineageos.jelly.xml
+          set_label_file gapps_product_raw/etc/sysconfig/initial-package-stopped-states-org.lineageos.jelly.xml
+
+          for f in gapps_product_raw/overlay/LatinIME__*_auto_generated_rro_product.apk; do
+            set_label_file "$f"
           done
 
-          # android.ext.services APEX (AOSP)
           if [ ! -f gapps_system_raw/system/apex/com.android.extservices.apex ]; then
             if [ -f vanilla_system_raw/system/apex/com.android.extservices.capex ]; then
               mkdir -p "$WORK_ROOT/tmp/capex_extract"
@@ -479,11 +502,9 @@ jobs:
               cp -a vanilla_system_raw/system/apex/com.android.extservices.apex gapps_system_raw/system/apex/ 2>/dev/null || true
             fi
           fi
-          if [ -f gapps_system_raw/system/apex/com.android.extservices.apex ]; then
-            setfattr -n security.selinux -v "u:object_r:system_file:s0" gapps_system_raw/system/apex/com.android.extservices.apex || true
-          fi
+          set_label_file gapps_system_raw/system/apex/com.android.extservices.apex
 
-          echo "AOSP components added"
+          echo "AOSP components added with SELinux labels"
 
       - name: Detect original UUIDs and filesystem parameters
         run: |
@@ -787,7 +808,7 @@ jobs:
             - convert-to-vanilla.zip (recovery flashable)
 
             Filesystem parameters and UUIDs preserved from original images.
-            SELinux contexts preserved.
+            SELinux contexts preserved on all added files.
             AOSP components (ExtShared, ModuleMetadata, Provision, ThemePicker,
             DeskClock, ExactCalculator, LatinIME, WebView, Contacts, LiveWallpapersPicker,
             WallpaperBackup, ContactsPicker, Jelly browser) added from Vanilla.
