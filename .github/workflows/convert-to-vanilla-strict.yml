@@ -1,4 +1,4 @@
-name: Convert GApps to Vanilla
+name: Convert GApps to Vanilla Strict
 
 on:
   workflow_dispatch:
