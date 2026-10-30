@@ -49,6 +49,7 @@ jobs:
             wget \
             jq \
             file \
+            rsync \
             build-essential \
             liblz4-dev \
             liblzma-dev \
@@ -223,10 +224,18 @@ jobs:
               fi
             fi
 
-            if sudo mount -o loop,ro "$img" "$out" >/dev/null 2>&1; then
-              echo "  OK: mount loop (xattr preserved)"
+            local mnt="$WORK_ROOT/tmp/mnt_$$"
+            rm -rf "$mnt"; mkdir -p "$mnt"
+            if sudo mount -o loop,ro "$img" "$mnt" >/dev/null 2>&1; then
+              echo "  OK: mount loop (copying contents then unmounting)"
+              sudo rsync -aHAX --numeric-ids --exclude=lost+found "$mnt"/ "$out"/ || \
+                sudo cp -a "$mnt"/. "$out"/
+              sudo umount "$mnt" || sudo umount -l "$mnt" || true
+              sudo chown -R $USER:$USER "$out" || true
+              rm -rf "$mnt"
               return 0
             fi
+            rm -rf "$mnt"
 
             if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
               echo "  OK: sparse -> simg2img"
@@ -279,7 +288,7 @@ jobs:
 
           is_apex_path() {
             case "$1" in
-              system/apex/*|*/system/apex/*) return 0 ;;
+              apex/*|*/apex/*) return 0 ;;
             esac
             return 1
           }
@@ -309,7 +318,13 @@ jobs:
           copy_preserve_xattr() {
             local src="$1" dst="$2"
             mkdir -p "$(dirname "$dst")"
-            cp -a --preserve=all "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
+            if [ ! -r "$src" ]; then
+              echo "  WARN: unreadable $src, trying sudo cp"
+              sudo cp -a --preserve=all "$src" "$dst" 2>/dev/null || { echo "  ERROR: cannot copy $src"; return 1; }
+              sudo chown $USER:$USER "$dst" || true
+            else
+              cp -a --preserve=all "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
+            fi
             if command -v setfattr >/dev/null 2>&1; then
               if ! getfattr -n security.selinux "$dst" >/dev/null 2>&1; then
                 setfattr -n security.selinux -v "u:object_r:system_file:s0" "$dst" 2>/dev/null || true
@@ -332,7 +347,9 @@ jobs:
             local root="$1" out="$2"
             : > "$out"
             [ -d "$root" ] || return 0
-            ( cd "$root" && find . -mindepth 1 \( -type f -o -type l -o -type d \) -print0 ) \
+            ( cd "$root" && find . -mindepth 1 \
+                -not -path './lost+found' -not -path './lost+found/*' \
+                \( -type f -o -type l -o -type d \) -print0 ) \
               | while IFS= read -r -d '' p; do
                   rel="${p#./}"
                   if [ -L "$root/$rel" ]; then
@@ -392,7 +409,7 @@ jobs:
               if is_apex_path "$rel"; then
                 materialize_apex "$src" "$dst" || true
               else
-                copy_preserve_xattr "$src" "$dst"
+                copy_preserve_xattr "$src" "$dst" || true
               fi
             done < "only_v_${part}.tsv"
 
@@ -412,7 +429,7 @@ jobs:
               if is_apex_path "$rel"; then
                 materialize_apex "$src" "$dst" || true
               else
-                copy_preserve_xattr "$src" "$dst"
+                copy_preserve_xattr "$src" "$dst" || true
               fi
             done < "diff_${part}.tsv"
           }
@@ -757,4 +774,4 @@ jobs:
             /mnt/work/work/*_format.txt
             /mnt/work/work/*_uuid.txt
             /mnt/work/work/*_erofs_params.txt
-          retention-days: 30
+          retention-days: 7
