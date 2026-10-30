@@ -1,0 +1,760 @@
+name: Convert GApps to Vanilla
+
+on:
+  workflow_dispatch:
+    inputs:
+      gapps_url:
+        description: 'URL of the GApps firmware (zip OTA, zip images, img.xz, or raw img)'
+        required: false
+        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-X6833B-18.10.2026-GAPPS-OFFICIAL.zip'
+      vanilla_url:
+        description: 'URL of the Vanilla firmware (zip OTA, zip images, img.xz, or raw img)'
+        required: false
+        default: 'https://mirror.tejas101k.workers.dev/0:/Project_Infinity-X-4.1-dubai-18.10.2026-VANILLA-OFFICIAL.zip'
+      release_tag:
+        description: 'Release tag (use "auto" for automatic timestamp-based tag)'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    name: Convert GApps to Vanilla
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      WORK_ROOT: /mnt/work
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            erofs-utils \
+            e2fsprogs \
+            android-sdk-libsparse-utils \
+            zip \
+            unzip \
+            xz-utils \
+            attr \
+            acl \
+            p7zip-full \
+            curl \
+            wget \
+            jq \
+            file \
+            build-essential \
+            liblz4-dev \
+            liblzma-dev \
+            libzstd-dev \
+            uuid-dev \
+            libselinux1-dev \
+            libfuse-dev \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            python3 \
+            python3-pip
+
+      - name: Create working directories on ext4 (/mnt/work)
+        run: |
+          sudo mkdir -p "$WORK_ROOT"
+          sudo chown $USER:$USER "$WORK_ROOT"
+          mkdir -p "$WORK_ROOT/gapps" "$WORK_ROOT/vanilla" "$WORK_ROOT/work" "$WORK_ROOT/otaripper" "$WORK_ROOT/erofs-utils-src" "$WORK_ROOT/tmp"
+          echo "Working directories created in $WORK_ROOT (ext4)."
+          df -T "$WORK_ROOT"
+          mount | grep /mnt || true
+
+      - name: Build erofs-utils from source (>= 1.8 for fsck.erofs --xattrs)
+        run: |
+          set -e
+          SRC="$WORK_ROOT/erofs-utils-src"
+          git clone --depth=1 --branch v1.8.2 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git "$SRC"
+          cd "$SRC"
+          ./autogen.sh
+          ./configure --prefix=/usr/local --enable-fuse
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          echo "=== erofs-utils installed ==="
+          which mkfs.erofs fsck.erofs dump.erofs erofsfuse extract.erofs || true
+          echo "=== mkfs.erofs ==="
+          mkfs.erofs 2>&1 | head -1 || true
+          echo "=== fsck.erofs ==="
+          fsck.erofs 2>&1 | head -1 || true
+          echo "=== extract support ==="
+          fsck.erofs --help 2>&1 | grep -i "xattr" || true
+          echo "=== extract.erofs ==="
+          extract.erofs --help 2>&1 | head -5 || true
+
+      - name: Install otaripper (fastest payload extractor, Rust + SIMD)
+        run: |
+          set -e
+          URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux-static-x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          if [ -z "$URL" ]; then
+            URL=$(curl -sL https://api.github.com/repos/syedinsaf/otaripper/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux.*x86_64.*\\.tar\\.gz$")) | .browser_download_url' \
+              | head -1)
+          fi
+          echo "Downloading otaripper: $URL"
+          mkdir -p "$WORK_ROOT/otaripper"
+          curl -L -o "$WORK_ROOT/otaripper.tar.gz" "$URL"
+          tar --no-same-owner --no-same-permissions -xzf "$WORK_ROOT/otaripper.tar.gz" -C "$WORK_ROOT/otaripper" || true
+          BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' -executable | head -1)
+          if [ -z "$BIN" ]; then
+            BIN=$(find "$WORK_ROOT/otaripper" -maxdepth 2 -type f -name 'otaripper*' | head -1)
+          fi
+          echo "Found binary: $BIN"
+          sudo cp "$BIN" /usr/local/bin/otaripper
+          sudo chmod +x /usr/local/bin/otaripper
+          otaripper --version 2>&1 | head -5 || true
+          otaripper --help 2>&1 | head -20 || true
+
+      - name: Download GApps firmware
+        run: |
+          echo "Downloading GApps firmware from: ${{ github.event.inputs.gapps_url }}"
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused \
+            -o "$WORK_ROOT/gapps/image" \
+            "${{ github.event.inputs.gapps_url }}"
+          ls -lh "$WORK_ROOT/gapps/image"
+
+      - name: Download Vanilla firmware
+        run: |
+          echo "Downloading Vanilla firmware from: ${{ github.event.inputs.vanilla_url }}"
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused \
+            -o "$WORK_ROOT/vanilla/image" \
+            "${{ github.event.inputs.vanilla_url }}"
+          ls -lh "$WORK_ROOT/vanilla/image"
+
+      - name: Extract GApps archive and payload.bin (otaripper)
+        run: |
+          set -e
+          cd "$WORK_ROOT/gapps"
+          mkdir -p extracted
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "GApps: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "GApps: xz OK"
+            [ -f image ] && mv image extracted/system.img
+          else
+            echo "GApps: raw image (no archive), treating as system.img"
+            mv image extracted/system.img
+          fi
+
+          if [ -f extracted/payload.bin ]; then
+            echo "GApps: payload.bin detected, extracting images with otaripper..."
+            mkdir -p extracted/images
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || {
+              echo "otaripper failed, trying all partitions"
+              otaripper extracted/payload.bin -o extracted/images || true
+            }
+            ls -lh extracted/images/ || true
+            find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
+          fi
+
+          echo "=== GApps extracted ==="
+          ls -lh extracted/
+
+      - name: Extract Vanilla archive and payload.bin (otaripper)
+        run: |
+          set -e
+          cd "$WORK_ROOT/vanilla"
+          mkdir -p extracted
+
+          if unzip -o image -d extracted >/dev/null 2>&1; then
+            echo "Vanilla: unzip OK"
+          elif xz -dk image 2>/dev/null; then
+            echo "Vanilla: xz OK"
+            [ -f image ] && mv image extracted/system.img
+          else
+            echo "Vanilla: raw image (no archive), treating as system.img"
+            mv image extracted/system.img
+          fi
+
+          if [ -f extracted/payload.bin ]; then
+            echo "Vanilla: payload.bin detected, extracting images with otaripper..."
+            mkdir -p extracted/images
+            otaripper extracted/payload.bin -o extracted/images -p system,system_ext,product || {
+              echo "otaripper failed, trying all partitions"
+              otaripper extracted/payload.bin -o extracted/images || true
+            }
+            ls -lh extracted/images/ || true
+            find extracted/images -maxdepth 2 -name "system.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "system_ext.img" -exec mv {} extracted/ \;
+            find extracted/images -maxdepth 2 -name "product.img" -exec mv {} extracted/ \;
+          fi
+
+          echo "=== Vanilla extracted ==="
+          ls -lh extracted/
+
+      - name: Auto-detect image formats and extract partitions
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          extract_image() {
+            local img="$1"
+            local out="$2"
+            mkdir -p "$out"
+            echo "  Image: $img"
+
+            if fsck.erofs --extract="$out" --xattrs --preserve "$img" >/dev/null 2>&1; then
+              echo "  OK: fsck.erofs --extract --xattrs --preserve"
+              return 0
+            fi
+
+            if command -v extract.erofs >/dev/null 2>&1; then
+              if extract.erofs -x -i "$img" -o "$out" >/dev/null 2>&1; then
+                echo "  OK: extract.erofs -x"
+                return 0
+              fi
+            fi
+
+            if sudo mount -o loop,ro "$img" "$out" >/dev/null 2>&1; then
+              echo "  OK: mount loop (xattr preserved)"
+              return 0
+            fi
+
+            if simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
+              echo "  OK: sparse -> simg2img"
+              extract_image "${img}.raw" "$out"
+              return $?
+            fi
+
+            echo "  ERROR: unable to extract $img"
+            return 1
+          }
+
+          echo "=== Extracting GApps partitions ==="
+          for part in system system_ext product; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ]; then
+              echo "GApps ${part}: $img"
+              extract_image "$img" "gapps_${part}_raw" || exit 1
+            else
+              echo "WARNING: GApps ${part}.img not found"
+            fi
+          done
+
+          echo "=== Extracting Vanilla partitions ==="
+          for part in system system_ext product; do
+            img=$(find "$WORK_ROOT/vanilla/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ]; then
+              echo "Vanilla ${part}: $img"
+              extract_image "$img" "vanilla_${part}_raw" || exit 1
+            else
+              echo "WARNING: Vanilla ${part}.img not found"
+            fi
+          done
+
+          echo "=== Extraction complete ==="
+          ls -la
+
+      - name: Compute and apply GApps to Vanilla diff (AOSP replacement)
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          is_protected() {
+            local rel="$1"
+            case "$rel" in
+              build.prop) return 0 ;;
+              */build.prop) return 0 ;;
+            esac
+            return 1
+          }
+
+          is_apex_path() {
+            case "$1" in
+              system/apex/*|*/system/apex/*) return 0 ;;
+            esac
+            return 1
+          }
+
+          materialize_apex() {
+            local src="$1" dst="$2"
+            mkdir -p "$(dirname "$dst")"
+            case "$src" in
+              *.capex)
+                local tmp="$WORK_ROOT/tmp/capex_$$"
+                rm -rf "$tmp"; mkdir -p "$tmp"
+                if unzip -o "$src" -d "$tmp" >/dev/null 2>&1 && [ -f "$tmp/original_apex" ]; then
+                  cp -a "$tmp/original_apex" "$dst"
+                else
+                  echo "  WARN: cannot materialize $src (no original_apex)"
+                  rm -rf "$tmp"
+                  return 1
+                fi
+                rm -rf "$tmp"
+                ;;
+              *)
+                cp -a "$src" "$dst"
+                ;;
+            esac
+          }
+
+          copy_preserve_xattr() {
+            local src="$1" dst="$2"
+            mkdir -p "$(dirname "$dst")"
+            cp -a --preserve=all "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
+            if command -v setfattr >/dev/null 2>&1; then
+              if ! getfattr -n security.selinux "$dst" >/dev/null 2>&1; then
+                setfattr -n security.selinux -v "u:object_r:system_file:s0" "$dst" 2>/dev/null || true
+              fi
+            fi
+          }
+
+          file_sig() {
+            local f="$1"
+            local sz
+            sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+            if [ "$sz" -lt 4194304 ]; then
+              sha256sum "$f" 2>/dev/null | awk '{print "sha256:"$1}'
+            else
+              stat -c "size:%s:mtime:%Y" "$f" 2>/dev/null
+            fi
+          }
+
+          build_manifest() {
+            local root="$1" out="$2"
+            : > "$out"
+            [ -d "$root" ] || return 0
+            ( cd "$root" && find . -mindepth 1 \( -type f -o -type l -o -type d \) -print0 ) \
+              | while IFS= read -r -d '' p; do
+                  rel="${p#./}"
+                  if [ -L "$root/$rel" ]; then
+                    printf 'L\t%s\t%s\n' "$rel" "$(readlink "$root/$rel")"
+                  elif [ -f "$root/$rel" ]; then
+                    printf 'F\t%s\t%s\n' "$rel" "$(file_sig "$root/$rel")"
+                  elif [ -d "$root/$rel" ]; then
+                    printf 'D\t%s\t-\n' "$rel"
+                  fi
+                done >> "$out"
+            sort -t $'\t' -k2,2 "$out" -o "$out"
+          }
+
+          apply_part_diff() {
+            local part="$1"
+            local gapps_dir="gapps_${part}_raw"
+            local vanilla_dir="vanilla_${part}_raw"
+            [ -d "$gapps_dir" ] || { echo "SKIP $part: no gapps dir"; return 0; }
+            [ -d "$vanilla_dir" ] || { echo "SKIP $part: no vanilla dir"; return 0; }
+
+            echo "=== Diff $part ==="
+            build_manifest "$gapps_dir"   "manifest_g_${part}.tsv"
+            build_manifest "$vanilla_dir" "manifest_v_${part}.tsv"
+
+            awk -F'\t' '
+              NR==FNR { v[$2]=1; next }
+              ($1=="F"||$1=="L") && !($2 in v) { print $1"\t"$2 }
+            ' "manifest_v_${part}.tsv" "manifest_g_${part}.tsv" > "only_g_${part}.tsv"
+
+            awk -F'\t' '
+              NR==FNR { g[$2]=1; next }
+              ($1=="F"||$1=="L") && !($2 in g) { print $1"\t"$2 }
+            ' "manifest_g_${part}.tsv" "manifest_v_${part}.tsv" > "only_v_${part}.tsv"
+
+            awk -F'\t' '
+              NR==FNR { gh[$2]=$3; gt[$2]=$1; next }
+              ($1=="F") && (($2 in gh)) && (gt[$2]=="F") && (gh[$2] != $3) { print "F\t"$2 }
+            ' "manifest_g_${part}.tsv" "manifest_v_${part}.tsv" > "diff_${part}.tsv"
+
+            echo "  only_in_gapps:   $(wc -l < only_g_${part}.tsv)"
+            echo "  only_in_vanilla: $(wc -l < only_v_${part}.tsv)"
+            echo "  differ:          $(wc -l < diff_${part}.tsv)"
+
+            while IFS=$'\t' read -r t rel; do
+              [ -z "$rel" ] && continue
+              if is_protected "$rel"; then
+                echo "  KEEP(build.prop) $rel"
+                continue
+              fi
+              rm -f "$gapps_dir/$rel"
+            done < "only_g_${part}.tsv"
+
+            while IFS=$'\t' read -r t rel; do
+              [ -z "$rel" ] && continue
+              src="$vanilla_dir/$rel"
+              dst="$gapps_dir/$rel"
+              if is_apex_path "$rel"; then
+                materialize_apex "$src" "$dst" || true
+              else
+                copy_preserve_xattr "$src" "$dst"
+              fi
+            done < "only_v_${part}.tsv"
+
+            while IFS=$'\t' read -r t rel; do
+              [ -z "$rel" ] && continue
+              if is_protected "$rel"; then
+                echo "  KEEP(build.prop) $rel (differs, not replaced)"
+                continue
+              fi
+              case "$rel" in
+                *framework-res.apk|framework-res.apk)
+                  echo "  WARN: replacing framework-res.apk with AOSP version"
+                  ;;
+              esac
+              src="$vanilla_dir/$rel"
+              dst="$gapps_dir/$rel"
+              if is_apex_path "$rel"; then
+                materialize_apex "$src" "$dst" || true
+              else
+                copy_preserve_xattr "$src" "$dst"
+              fi
+            done < "diff_${part}.tsv"
+          }
+
+          for part in system system_ext product; do
+            apply_part_diff "$part"
+          done
+
+          echo "=== Diff applied ==="
+
+      - name: Detect original UUIDs and filesystem parameters
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          for part in system system_ext product; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ] && [ -f "$img" ]; then
+              if dump.erofs -s "$img" >/dev/null 2>&1; then
+                UUID=$(dump.erofs -s "$img" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
+                echo "${part}: EROFS, UUID=${UUID:-unknown}"
+                echo "$UUID" > "${part}_uuid.txt"
+                echo "erofs" > "${part}_format.txt"
+              elif blkid -o value -s UUID "$img" >/dev/null 2>&1; then
+                UUID=$(blkid -o value -s UUID "$img" 2>/dev/null || true)
+                echo "${part}: ext4, UUID=${UUID:-unknown}"
+                echo "$UUID" > "${part}_uuid.txt"
+                echo "ext4" > "${part}_format.txt"
+              elif simg2img "$img" "${img}.raw" >/dev/null 2>&1; then
+                if dump.erofs -s "${img}.raw" >/dev/null 2>&1; then
+                  UUID=$(dump.erofs -s "${img}.raw" 2>/dev/null | grep -oP 'UUID:\s*\K[0-9a-f-]+' | head -1 || true)
+                  echo "${part}: sparse EROFS, UUID=${UUID:-unknown}"
+                  echo "$UUID" > "${part}_uuid.txt"
+                  echo "erofs" > "${part}_format.txt"
+                elif blkid -o value -s UUID "${img}.raw" >/dev/null 2>&1; then
+                  UUID=$(blkid -o value -s UUID "${img}.raw" 2>/dev/null || true)
+                  echo "${part}: sparse ext4, UUID=${UUID:-unknown}"
+                  echo "$UUID" > "${part}_uuid.txt"
+                  echo "ext4" > "${part}_format.txt"
+                fi
+              else
+                echo "${part}: unknown format"
+                echo "" > "${part}_uuid.txt"
+                echo "erofs" > "${part}_format.txt"
+              fi
+            else
+              echo "WARNING: GApps ${part}.img not found"
+              echo "" > "${part}_uuid.txt"
+              echo "erofs" > "${part}_format.txt"
+            fi
+          done
+
+          echo "=== Detected ==="
+          for part in system system_ext product; do
+            echo "${part}: format=$(cat ${part}_format.txt) uuid=$(cat ${part}_uuid.txt)"
+          done
+
+      - name: Detect EROFS parameters from original images
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          detect_erofs_params() {
+            local img="$1"
+            local opts=""
+
+            local ftype=$(file -b "$img" 2>/dev/null)
+            local comp=""
+            if echo "$ftype" | grep -qi "LZ4"; then
+              comp="lz4"
+            elif echo "$ftype" | grep -qi "LZMA"; then
+              comp="lzma"
+            elif echo "$ftype" | grep -qi "DEFLATE"; then
+              comp="deflate"
+            elif echo "$ftype" | grep -qi "ZSTD"; then
+              comp="zstd"
+            fi
+
+            local dump=""
+            if command -v dump.erofs >/dev/null 2>&1; then
+              dump=$(dump.erofs -s "$img" 2>/dev/null || true)
+            fi
+
+            local blocksize=4096
+            local pcluster=65536
+            local comp_level=""
+            local extra=""
+
+            if [ -n "$dump" ]; then
+              local blk_log2=$(echo "$dump" | grep -oP 'blkszbits[^\d]*\K\d+' | head -1)
+              if [ -z "$blk_log2" ]; then
+                blk_log2=$(echo "$dump" | grep -oP 'blocksize[^\d]*\K\d+' | head -1)
+              fi
+              if [ -n "$blk_log2" ]; then
+                if [ "$blk_log2" -le 16 ] 2>/dev/null; then
+                  blocksize=$((1 << blk_log2))
+                else
+                  blocksize=$blk_log2
+                fi
+              fi
+
+              local pc=$(echo "$dump" | grep -oP 'pclusterblks[^\d]*\K\d+' | head -1)
+              if [ -n "$pc" ]; then
+                pcluster=$((pc * blocksize))
+              else
+                pc=$(echo "$dump" | grep -oP 'physical.cluster[^\d]*\K\d+' | head -1)
+                if [ -n "$pc" ]; then
+                  pcluster=$pc
+                fi
+              fi
+
+              local lvl=$(echo "$dump" | grep -oP 'compress[._ ]?level[^\d]*\K\d+' | head -1)
+              if [ -n "$lvl" ]; then
+                comp_level=",level=$lvl"
+              fi
+
+              if echo "$dump" | grep -qi "FRAGMENTS"; then
+                extra="$extra -Efragments"
+              fi
+              if echo "$dump" | grep -qi "DEDUPE"; then
+                extra="$extra -Ededupe"
+              fi
+              if echo "$dump" | grep -qi "BIG_PCLUSTER"; then
+                extra="$extra -C$pcluster"
+              fi
+              if echo "$dump" | grep -qi "ZERO_PADDING\|LZ4_0PADDING"; then
+                extra="$extra -E0padding"
+              fi
+            fi
+
+            [ -z "$blocksize" ] && blocksize=4096
+            [ -z "$pcluster" ] && pcluster=65536
+            [ -z "$comp" ] && comp="lz4hc"
+
+            opts="-z$comp$comp_level -b$blocksize"
+            if [ "$pcluster" != "4096" ]; then
+              opts="$opts -C$pcluster"
+            fi
+            opts="$opts $extra"
+            opts=$(echo "$opts" | xargs)
+            echo "$opts"
+          }
+
+          for part in system system_ext product; do
+            img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+            if [ -n "$img" ] && [ -f "$img" ]; then
+              opts=$(detect_erofs_params "$img")
+              echo "EROFS params for ${part}: $opts"
+              echo "$opts" > "${part}_erofs_params.txt"
+            else
+              echo "-zlz4hc -b4096 -C65536" > "${part}_erofs_params.txt"
+            fi
+          done
+
+      - name: Rebuild images preserving format, UUID and SELinux
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+
+          build_erofs() {
+            local raw="$1"
+            local out="$2"
+            local uuid="$3"
+            local params_file="$4"
+            local opts=$(cat "$params_file" 2>/dev/null || echo "-zlz4hc -b4096 -C65536")
+            echo "  EROFS params: $opts"
+            if [ -n "$uuid" ]; then
+              mkfs.erofs $opts -U "$uuid" "$out" "$raw"
+            else
+              mkfs.erofs $opts "$out" "$raw"
+            fi
+          }
+
+          build_ext4() {
+            local raw="$1"
+            local out="$2"
+            local uuid="$3"
+            local orig_img="$4"
+
+            local size=$(du -sb "$raw" | awk '{print $1}')
+            size=$((size + size / 10 + 16*1024*1024))
+            truncate -s "$size" "$out"
+
+            if [ -n "$uuid" ]; then
+              mkfs.ext4 -F -U "$uuid" -d "$raw" "$out"
+            else
+              mkfs.ext4 -F -d "$raw" "$out"
+            fi
+
+            if [ -f "$orig_img" ] && file -b "$orig_img" | grep -qi "Android sparse"; then
+              img2simg "$out" "${out}.sparse"
+              mv "${out}.sparse" "$out"
+            fi
+          }
+
+          for part in system system_ext product; do
+            raw="gapps_${part}_raw"
+            fmt=$(cat "${part}_format.txt" 2>/dev/null || echo "erofs")
+            uuid=$(cat "${part}_uuid.txt" 2>/dev/null || echo "")
+            params_file="${part}_erofs_params.txt"
+            orig_img=$(find "$WORK_ROOT/gapps/extracted" -maxdepth 2 -name "${part}.img" 2>/dev/null | head -1)
+
+            if [ ! -d "$raw" ]; then
+              echo "WARNING: $raw not found, skipping $part"
+              continue
+            fi
+
+            echo "=== Building ${part} (format=$fmt, uuid=$uuid) ==="
+            if [ "$fmt" = "ext4" ]; then
+              build_ext4 "$raw" "${part}.img" "$uuid" "$orig_img"
+            else
+              build_erofs "$raw" "${part}.img" "$uuid" "$params_file"
+            fi
+
+            file "${part}.img"
+            ls -lh "${part}.img"
+          done
+
+      - name: Create recovery flashable ZIP
+        run: |
+          set -e
+          cd "$WORK_ROOT/work"
+          mkdir -p zip/META-INF/com/google/android
+
+          cp system.img zip/system.img
+          cp system_ext.img zip/system_ext.img
+          cp product.img zip/product.img
+
+          cat > zip/META-INF/com/google/android/update-binary <<'EOF'
+          #!/sbin/sh
+          OUTFD=$2
+          ZIPFILE=$3
+
+          ui_print() {
+            echo "ui_print $1" >&$OUTFD
+            echo "ui_print" >&$OUTFD
+          }
+
+          set_progress() {
+            echo "set_progress $1" >&$OUTFD
+          }
+
+          flash_image() {
+            local img="$1"
+            local part="$2"
+            if [ ! -f "$img" ]; then
+              ui_print "WARNING: $img not found, skipping $part"
+              return
+            fi
+            ui_print "Flashing $part from $img"
+            dd if="$img" of="/dev/block/by-name/$part" bs=1M 2>/dev/null || \
+              dd if="$img" of="/dev/block/bootdevice/by-name/$part" bs=1M 2>/dev/null || \
+              ui_print "ERROR: failed to flash $part"
+          }
+
+          ui_print "=== Convert GApps to Vanilla ==="
+          ui_print "Flashing system, system_ext, product"
+
+          set_progress 0.1
+          flash_image "system.img" "system"
+          set_progress 0.4
+          flash_image "system_ext.img" "system_ext"
+          set_progress 0.7
+          flash_image "product.img" "product"
+          set_progress 1.0
+
+          ui_print "=== Done ==="
+          ui_print "Reboot to system"
+          EOF
+          chmod +x zip/META-INF/com/google/android/update-binary
+
+          cat > zip/META-INF/com/google/android/updater-script <<'EOF'
+          package_extract_file("system.img", "/tmp/system.img");
+          package_extract_file("system_ext.img", "/tmp/system_ext.img");
+          package_extract_file("product.img", "/tmp/product.img");
+          run_program("/sbin/sh", "/tmp/update-binary", "3", "1", "/tmp/updater-script");
+          EOF
+
+          cd zip
+          zip -r -9 ../convert-to-vanilla.zip . -x "*.git*"
+          cd ..
+          ls -lh convert-to-vanilla.zip
+
+      - name: Determine release tag
+        id: release_tag
+        run: |
+          if [ "${{ github.event.inputs.release_tag }}" = "auto" ]; then
+            TAG="vanilla-$(date +%Y%m%d-%H%M)"
+          else
+            TAG="${{ github.event.inputs.release_tag }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Release tag: $TAG"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: "Vanilla ${{ steps.release_tag.outputs.tag }}"
+          body: |
+            Automated GApps to Vanilla conversion
+
+            GApps source: ${{ github.event.inputs.gapps_url }}
+            Vanilla source: ${{ github.event.inputs.vanilla_url }}
+
+            Artifacts:
+            - system.img
+            - system_ext.img
+            - product.img
+            - convert-to-vanilla.zip (recovery flashable)
+
+            Filesystem parameters and UUIDs preserved from original images.
+            SELinux contexts preserved on all added files.
+            Diff-based conversion: only files present in Vanilla are added,
+            only GApps-exclusive files are removed, differing files are replaced
+            with the Vanilla (AOSP) version. Exception: build.prop is never touched.
+          files: |
+            /mnt/work/work/system.img
+            /mnt/work/work/system_ext.img
+            /mnt/work/work/product.img
+            /mnt/work/work/convert-to-vanilla.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanilla-images
+          path: |
+            /mnt/work/work/system.img
+            /mnt/work/work/system_ext.img
+            /mnt/work/work/product.img
+            /mnt/work/work/convert-to-vanilla.zip
+            /mnt/work/work/manifest_g_*.tsv
+            /mnt/work/work/manifest_v_*.tsv
+            /mnt/work/work/only_g_*.tsv
+            /mnt/work/work/only_v_*.tsv
+            /mnt/work/work/diff_*.tsv
+            /mnt/work/work/*_format.txt
+            /mnt/work/work/*_uuid.txt
+            /mnt/work/work/*_erofs_params.txt
+          retention-days: 30
